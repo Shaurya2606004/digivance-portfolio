@@ -63,12 +63,17 @@ export function detectTier(isMobile = false) {
 
   const connection =
     navigator.connection || navigator.mozConnection || navigator.webkitConnection
+  const memory = navigator.deviceMemory || 8
+
+  // A 2 GB handset benefits more from zero decoder pressure than from a
+  // compressed film. The poster composition is the intentional floor.
+  if (isMobile && memory <= 2) return TIERS.POSTER
 
   if (!connection) {
     // No Network Information API (Safari, Firefox). Device memory is the only
     // other signal available, and the runtime meter corrects from there.
     if (isMobile) return TIERS.LITE
-    return (navigator.deviceMemory || 8) >= 8 ? TIERS.HD : TIERS.LITE
+    return memory >= 8 ? TIERS.HD : TIERS.LITE
   }
 
   if (connection.saveData) return TIERS.POSTER
@@ -84,7 +89,6 @@ export function detectTier(isMobile = false) {
   if (isMobile) return TIERS.LITE
 
   const downlink = connection.downlink || 0
-  const memory = navigator.deviceMemory || 8
   if (downlink && downlink < 3) return TIERS.LITE
   if (memory < 4) return TIERS.LITE
 
