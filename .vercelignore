@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.asset-originals/
+mobile/
+.claude/
+
+# Keep only the processed public assets used by the live experience.
+/*.mp4
+/*.png
+cinematic/**/*.mp4
+cinematic/**/*.png

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.asset-originals/
+mobile/
+.claude/
+
+# Local source captures and raw media are not part of the deployed site.
+/*.mp4
+/*.png
+cinematic/**/*.mp4
+cinematic/**/*.png

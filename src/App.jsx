@@ -1,0 +1,1195 @@
+import { memo, useLayoutEffect, useRef, useState } from 'react'
+import {
+  ArrowDownRight,
+  ArrowUpRight,
+  EnvelopeSimple,
+} from '@phosphor-icons/react'
+import gsap from 'gsap'
+import ScrollSmoother from 'gsap/ScrollSmoother'
+import { ScrollTrigger } from 'gsap/ScrollTrigger'
+import { connectors, contactEmail, scenes } from './content'
+import {
+  CLIP_FPS,
+  CONNECTOR_LEAD,
+  CONNECTOR_TAIL,
+  OUTRO_VH,
+  chapterRunwayVh,
+  connectorProgress,
+  connectorRunwayVh,
+  diveProgress,
+  mobileChapterRunwayVh,
+  mobileConnectorRunwayVh,
+  mobileTailRunwayVh,
+  tailRunwayVh,
+} from './pacing'
+import './styles.css'
+
+gsap.registerPlugin(ScrollTrigger, ScrollSmoother)
+
+const HALF_FRAME = 1 / CLIP_FPS / 2
+
+/*
+ * Seek scheduler.
+ *
+ * One seek is allowed in flight across a stage at a time, the newest target
+ * always wins, hidden layers are never seeked, and the next seek waits until
+ * the previous frame has actually been presented. The mobile encodes add a
+ * four-frame GOP, so this coalescing keeps even a fast touch flick responsive.
+ */
+const SEEK_TIMEOUT_MS = 220
+const MAX_CONCURRENT_LOADS = 2
+
+function createVideoController(
+  stage,
+  { mobile = false, maxConcurrentLoads = MAX_CONCURRENT_LOADS } = {},
+) {
+  const states = new Map()
+  const objectUrls = new Set()
+  const abortControllers = new Set()
+  const loadQueue = []
+
+  let rafId = 0
+  let seekLock = null
+  let seekLockedAt = 0
+  let activeLoads = 0
+  let destroyed = false
+  let userReady = false
+
+  const schedule = () => {
+    if (rafId || destroyed) return
+    rafId = window.requestAnimationFrame(step)
+  }
+
+  const releaseLock = (state) => {
+    if (destroyed) return
+    if (seekLock === state.key) seekLock = null
+    state.layer.classList.add('is-video-ready')
+    schedule()
+  }
+
+  const isVisible = (layer) => {
+    if (layer.style.visibility === 'hidden') return false
+    const opacity = layer.style.opacity
+    return opacity === '' || Number(opacity) > 0.02
+  }
+
+  function step() {
+    rafId = 0
+    if (destroyed) return
+
+    if (seekLock && performance.now() - seekLockedAt > SEEK_TIMEOUT_MS) {
+      seekLock = null
+    }
+
+    let more = false
+
+    states.forEach((state) => {
+      if (!state.ready) return
+
+      const { duration } = state.video
+      if (!Number.isFinite(duration) || duration <= 0) return
+
+      const lastFrameTime = Math.max(0, duration - HALF_FRAME)
+      const target = Math.min(
+        lastFrameTime,
+        Math.max(0, state.target * lastFrameTime),
+      )
+      if (Math.abs(target - state.applied) < HALF_FRAME) return
+
+      // A hidden layer keeps its target; the next seek call re-schedules it.
+      if (!isVisible(state.layer)) return
+
+      if (seekLock || state.video.seeking) {
+        more = true
+        return
+      }
+
+      try {
+        state.video.currentTime = target
+        state.applied = target
+        seekLock = state.key
+        seekLockedAt = performance.now()
+        if (state.usesFrameCallback) {
+          state.video.requestVideoFrameCallback(() => releaseLock(state))
+        }
+      } catch {
+        // The seekable range can lag decoded metadata by a frame or two.
+      }
+
+      more = true
+    })
+
+    if (more) schedule()
+  }
+
+  stage.querySelectorAll('[data-media-key]').forEach((layer) => {
+    const video = layer.querySelector('video[data-src]')
+    if (!video) return
+
+    const state = {
+      key: layer.dataset.mediaKey,
+      layer,
+      video,
+      source: video.dataset.src,
+      ready: false,
+      requested: false,
+      target: 0,
+      applied: -1,
+      primed: false,
+      priming: false,
+      usesFrameCallback:
+        typeof video.requestVideoFrameCallback === 'function',
+    }
+
+    layer.classList.remove('is-video-ready', 'has-media-error')
+
+    const onSeeked = () => {
+      if (!state.usesFrameCallback) releaseLock(state)
+    }
+    video.addEventListener('seeked', onSeeked)
+    state.detach = () => video.removeEventListener('seeked', onSeeked)
+
+    states.set(state.key, state)
+  })
+
+  const primeState = (state) => {
+    if (
+      !mobile ||
+      destroyed ||
+      !state.ready ||
+      state.primed ||
+      state.priming
+    ) {
+      return
+    }
+
+    state.priming = true
+    try {
+      const playRequest = state.video.play()
+      if (playRequest?.then) {
+        playRequest
+          .then(() => {
+            state.video.pause()
+            state.primed = true
+          })
+          .catch(() => {})
+          .finally(() => {
+            state.priming = false
+          })
+      } else {
+        state.video.pause()
+        state.primed = true
+        state.priming = false
+      }
+    } catch {
+      state.priming = false
+    }
+  }
+
+  const prime = () => {
+    userReady = true
+    states.forEach(primeState)
+  }
+
+  const pumpLoads = () => {
+    while (activeLoads < maxConcurrentLoads && loadQueue.length) {
+      const job = loadQueue.shift()
+      activeLoads += 1
+      job().finally(() => {
+        activeLoads -= 1
+        pumpLoads()
+      })
+    }
+  }
+
+  const fetchClip = (state) => {
+    const controller = new AbortController()
+    abortControllers.add(controller)
+
+    return fetch(state.source, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Video request failed: ${response.status}`)
+        return response.blob()
+      })
+      .then(
+        (blob) =>
+          new Promise((resolve) => {
+            if (destroyed) {
+              resolve()
+              return
+            }
+
+            const objectUrl = URL.createObjectURL(blob)
+            objectUrls.add(objectUrl)
+
+            const onLoadedData = () => {
+              state.video.removeEventListener('error', onError)
+              state.ready = true
+              state.applied = -1
+              if (userReady) primeState(state)
+              schedule()
+              resolve()
+            }
+            const onError = () => {
+              state.video.removeEventListener('loadeddata', onLoadedData)
+              state.layer.classList.add('has-media-error')
+              resolve()
+            }
+
+            state.video.addEventListener('loadeddata', onLoadedData, { once: true })
+            state.video.addEventListener('error', onError, { once: true })
+            state.video.src = objectUrl
+            state.video.load()
+          }),
+      )
+      .catch((error) => {
+        if (error.name !== 'AbortError') {
+          state.layer.classList.add('has-media-error')
+          console.warn(error)
+        }
+      })
+      .finally(() => abortControllers.delete(controller))
+  }
+
+  const load = (key, urgent = false) => {
+    const state = states.get(key)
+    if (!state || destroyed || state.requested) return
+
+    state.requested = true
+    const job = () => (destroyed ? Promise.resolve() : fetchClip(state))
+    if (urgent) loadQueue.unshift(job)
+    else loadQueue.push(job)
+    pumpLoads()
+  }
+
+  const seek = (key, progress) => {
+    const state = states.get(key)
+    if (!state || destroyed) return
+
+    state.target = progress <= 0 ? 0 : progress >= 1 ? 1 : progress
+    if (!state.ready) {
+      load(key, true)
+      return
+    }
+    schedule()
+  }
+
+  const destroy = () => {
+    destroyed = true
+    loadQueue.length = 0
+    if (rafId) window.cancelAnimationFrame(rafId)
+    abortControllers.forEach((controller) => controller.abort())
+    states.forEach((state) => {
+      state.detach?.()
+      state.layer.classList.remove('is-video-ready', 'has-media-error')
+      state.video.removeAttribute('src')
+      state.video.load()
+    })
+    objectUrls.forEach((objectUrl) => URL.revokeObjectURL(objectUrl))
+    states.clear()
+  }
+
+  return { load, seek, prime, destroy }
+}
+
+function Wordmark() {
+  return (
+    <span className="wordmark" aria-label="digiVance">
+      digi<span>V</span>ance
+    </span>
+  )
+}
+
+function Header() {
+  return (
+    <header className="site-header">
+      <a className="brand-link" href="#top" aria-label="digiVance home">
+        <Wordmark />
+      </a>
+      <nav className="primary-nav" aria-label="Primary navigation">
+        <a className="work-link" href="#studio-agriya">
+          Work
+        </a>
+        <a className="nav-cta" href="#contact">
+          Start a project
+          <ArrowUpRight aria-hidden="true" weight="bold" />
+        </a>
+      </nav>
+    </header>
+  )
+}
+
+function ProjectLink({ href, children, className = '' }) {
+  return (
+    <a className={`text-link ${className}`.trim()} href={href}>
+      <span>{children}</span>
+      <ArrowDownRight aria-hidden="true" weight="bold" />
+    </a>
+  )
+}
+
+function LiveProjectLink({ scene }) {
+  return (
+    <a
+      className="live-project-link"
+      href={scene.projectUrl}
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label={`View ${scene.client} live project. Opens in a new tab.`}
+    >
+      <span>
+        <strong>View live project</strong>
+        <small>{scene.projectDomain}</small>
+      </span>
+      <ArrowUpRight aria-hidden="true" weight="bold" />
+    </a>
+  )
+}
+
+function ChapterCopy({ scene, headingId }) {
+  const Heading = scene.kind === 'intro' ? 'h1' : 'h2'
+
+  return (
+    <div className="chapter-copy">
+      {scene.eyebrow && <p className="eyebrow">{scene.eyebrow}</p>}
+      {scene.client && (
+        <div className="project-context">
+          <p>{scene.type}</p>
+          <span>Live project</span>
+        </div>
+      )}
+      <Heading id={headingId} className="chapter-title">
+        {scene.title}
+      </Heading>
+      {scene.outcome && <p className="project-outcome">{scene.outcome}</p>}
+      <p className="chapter-body">{scene.body}</p>
+
+      {scene.kind === 'intro' && (
+        <ProjectLink href="#studio-agriya" className="chapter-action">
+          Explore live projects
+        </ProjectLink>
+      )}
+
+      {scene.projectUrl && <LiveProjectLink scene={scene} />}
+
+      {scene.kind === 'contact' && (
+        <a className="contact-link" href={`mailto:${contactEmail}`}>
+          <EnvelopeSimple aria-hidden="true" weight="bold" />
+          <span>
+            Start a project
+            <small>{contactEmail}</small>
+          </span>
+          <ArrowUpRight aria-hidden="true" weight="bold" />
+        </a>
+      )}
+    </div>
+  )
+}
+
+function Chapter({ scene, index }) {
+  const headingId = `${scene.id}-mobile-title`
+
+  return (
+    <article
+      className={`chapter chapter-${scene.kind || 'project'} align-${scene.align}`}
+      id={scene.id}
+      data-scene={index}
+      style={{
+        '--chapter-runway': `${chapterRunwayVh(index)}dvh`,
+        '--chapter-runway-mobile': `${mobileChapterRunwayVh(index)}svh`,
+      }}
+      aria-labelledby={headingId}
+    >
+      <div className="mobile-poster-wrap">
+        <img
+          className="mobile-poster"
+          src={scene.mobileImage || scene.image}
+          alt={scene.imageAlt}
+          loading={index === 0 ? 'eager' : 'lazy'}
+          fetchPriority={index === 0 ? 'high' : 'auto'}
+          decoding="async"
+        />
+      </div>
+
+      <div className="chapter-inner">
+        <ChapterCopy scene={scene} headingId={headingId} />
+      </div>
+    </article>
+  )
+}
+
+function DesktopCopyStage({ copyStageRef, activeScene }) {
+  return (
+    <div className="desktop-copy-stage" ref={copyStageRef}>
+      {scenes.map((scene, index) => {
+        const headingId = `${scene.id}-desktop-title`
+
+        return (
+          <section
+            className={`desktop-copy-frame chapter-${scene.kind || 'project'} align-${scene.align} ${activeScene === index ? 'is-active' : ''}`}
+            data-copy={index}
+            aria-labelledby={headingId}
+            key={scene.id}
+          >
+            <ChapterCopy scene={scene} headingId={headingId} />
+          </section>
+        )
+      })}
+    </div>
+  )
+}
+
+function RouteRail({ activeScene }) {
+  return (
+    <nav className="route-rail" aria-label="Project chapters">
+      {scenes.map((scene, index) => (
+        <a
+          key={scene.id}
+          className={activeScene === index ? 'is-active' : ''}
+          href={`#${scene.id}`}
+          aria-current={activeScene === index ? 'step' : undefined}
+        >
+          <span className="route-line" aria-hidden="true" />
+          <span className="route-label">{scene.shortLabel}</span>
+        </a>
+      ))}
+    </nav>
+  )
+}
+
+/*
+ * Desktop and mobile keep isolated media trees/controllers. The portrait stage
+ * receives stable props, so desktop scrim changes never reconcile its videos.
+ */
+const VisualStage = memo(function VisualStage({
+  stageRef,
+  sideClass,
+  variant = 'desktop',
+}) {
+  const isMobile = variant === 'mobile'
+
+  return (
+    <div
+      className={`visual-stage visual-stage-${variant} ${sideClass}`.trim()}
+      ref={stageRef}
+      aria-hidden="true"
+    >
+      <div className="visual-stack">
+        {scenes.map((scene, index) => {
+          const video = isMobile ? scene.mobileVideo : scene.video
+          const poster = isMobile
+            ? scene.mobileVideoPoster || scene.mobileImage
+            : scene.videoPoster || scene.image
+
+          return (
+            <figure
+              className="visual-layer scene-visual"
+              data-scene-visual={index}
+              data-media-key={`scene-${index}`}
+              key={`${variant}-${scene.id}`}
+            >
+              <img
+                className="media-poster"
+                src={poster}
+                alt=""
+                loading={index === 0 ? 'eager' : 'lazy'}
+                fetchPriority={index === 0 ? 'high' : 'auto'}
+                decoding="async"
+              />
+              {video && (
+                <video
+                  className="scrub-video"
+                  data-src={video}
+                  muted
+                  playsInline
+                  preload="none"
+                  disablePictureInPicture
+                  tabIndex="-1"
+                />
+              )}
+            </figure>
+          )
+        })}
+        {connectors.map((connector, index) => {
+          const video = isMobile ? connector.mobileVideo : connector.video
+          const poster = isMobile
+            ? connector.mobilePoster || scenes[index + 1]?.mobileVideoPoster
+            : connector.poster
+
+          return video ? (
+            <figure
+              className="visual-layer connector-visual"
+              data-connector-visual={index}
+              data-media-key={`connector-${index}`}
+              key={`${variant}-${connector.id}`}
+            >
+              <img
+                className="media-poster"
+                src={poster}
+                alt=""
+                loading="lazy"
+                decoding="async"
+              />
+              <video
+                className="scrub-video"
+                data-src={video}
+                muted
+                playsInline
+                preload="none"
+                disablePictureInPicture
+                tabIndex="-1"
+              />
+            </figure>
+          ) : null
+        })}
+      </div>
+      <div className="stage-scrim" />
+      <div className="stage-grain" />
+    </div>
+  )
+})
+
+function App() {
+  const experienceRef = useRef(null)
+  const stageRef = useRef(null)
+  const mobileStageRef = useRef(null)
+  const copyStageRef = useRef(null)
+  const smoothWrapperRef = useRef(null)
+  const smoothContentRef = useRef(null)
+  const [activeScene, setActiveScene] = useState(0)
+
+  useLayoutEffect(() => {
+    const experience = experienceRef.current
+    const stage = stageRef.current
+    const mobileStage = mobileStageRef.current
+    const copyStage = copyStageRef.current
+    const smoothWrapper = smoothWrapperRef.current
+    const smoothContent = smoothContentRef.current
+    if (
+      !experience ||
+      !stage ||
+      !mobileStage ||
+      !copyStage ||
+      !smoothWrapper ||
+      !smoothContent
+    ) {
+      return undefined
+    }
+
+    const mm = gsap.matchMedia()
+
+    mm.add(
+      '(min-width: 861px) and (prefers-reduced-motion: no-preference)',
+      () => {
+        let cancelled = false
+        const videoController = createVideoController(stage)
+        const chapters = gsap.utils.toArray('.chapter', experience)
+        chapters.forEach((chapter) => chapter.setAttribute('aria-hidden', 'true'))
+
+        /*
+         * Lazy posters finish loading while the visitor is mid-scroll, and
+         * dvh-based heights change when browser chrome hides. Letting either
+         * fire an automatic refresh is what made the journey jump position.
+         * Layout here does not depend on media size, so refreshes are taken
+         * manually, on a real width change only.
+         */
+        ScrollTrigger.config({
+          ignoreMobileResize: true,
+          autoRefreshEvents: 'visibilitychange,DOMContentLoaded,load',
+        })
+
+        ScrollSmoother.get()?.kill()
+        const smoother = ScrollSmoother.create({
+          wrapper: smoothWrapper,
+          content: smoothContent,
+          smooth: 0.8,
+          speed: 1,
+          effects: false,
+          smoothTouch: 0,
+          // normalizeScroll takes over the scroll position itself, which
+          // desynced the smoother from native scroll (scrollbar drags, keyboard
+          // paging, reload restore). This block is desktop-only, so the touch
+          // jitter it exists to fix does not apply here.
+          normalizeScroll: false,
+          ignoreMobileResize: true,
+        })
+
+        const internalLinks = Array.from(
+          document.querySelectorAll('a[href^="#"]'),
+        )
+        const scrollToHash = (hash, smooth = true) => {
+          const target = hash === '#main' ? 0 : document.getElementById(hash.slice(1))
+          if (target === null) return false
+          smoother.scrollTo(target, smooth, 'top top')
+          return true
+        }
+        const onInternalLinkClick = (event) => {
+          const link = event.currentTarget
+          const hash = link.getAttribute('href')
+          if (!hash || !scrollToHash(hash)) return
+
+          event.preventDefault()
+          window.history.pushState(null, '', hash)
+
+          if (link.classList.contains('skip-link')) {
+            document.getElementById('main')?.focus({ preventScroll: true })
+          }
+        }
+        const onPopState = () => {
+          if (window.location.hash) scrollToHash(window.location.hash)
+          else smoother.scrollTo(0, true)
+        }
+
+        internalLinks.forEach((link) =>
+          link.addEventListener('click', onInternalLinkClick),
+        )
+        window.addEventListener('popstate', onPopState)
+        const initialHashFrame = window.requestAnimationFrame(() => {
+          if (window.location.hash) scrollToHash(window.location.hash, false)
+        })
+
+        let lastWidth = window.innerWidth
+        let resizeTimer = 0
+        const onResize = () => {
+          if (window.innerWidth === lastWidth) return
+          lastWidth = window.innerWidth
+          window.clearTimeout(resizeTimer)
+          resizeTimer = window.setTimeout(() => {
+            if (!cancelled) ScrollTrigger.refresh()
+          }, 200)
+        }
+        window.addEventListener('resize', onResize)
+
+        const sceneVisuals = gsap.utils.toArray('.scene-visual', stage)
+        const connectorVisuals = new Map(
+          gsap
+            .utils
+            .toArray('.connector-visual', stage)
+            .map((visual) => [Number(visual.dataset.connectorVisual), visual]),
+        )
+        const copies = gsap.utils.toArray('.chapter-copy', copyStage)
+
+        const loadAround = (index) => {
+          videoController.load(`scene-${index}`, true)
+          if (connectors[index]?.video) videoController.load(`connector-${index}`)
+          if (index + 1 < scenes.length) videoController.load(`scene-${index + 1}`)
+          if (index > 0 && connectors[index - 1]?.video) {
+            videoController.load(`connector-${index - 1}`)
+          }
+        }
+
+        /*
+         * No scale tween on the layers. The camera move lives entirely in the
+         * footage, and an extra zoom would break the frame match that makes the
+         * seam cross-fades invisible.
+         */
+        gsap.set(sceneVisuals, { autoAlpha: 0, scale: 1 })
+        gsap.set(Array.from(connectorVisuals.values()), { autoAlpha: 0, scale: 1 })
+        gsap.set(sceneVisuals[0], { autoAlpha: 1 })
+        gsap.set(copies.slice(1), {
+          autoAlpha: 0,
+          clipPath: 'inset(0 100% 0 0)',
+          xPercent: -3,
+        })
+
+        const intro = gsap.timeline({ defaults: { ease: 'power3.out' } })
+        intro.fromTo(
+          copies[0],
+          { clipPath: 'inset(0 100% 0 0)', xPercent: -3 },
+          { clipPath: 'inset(0 -8% 0 0)', xPercent: 0, duration: 1.05 },
+          0.18,
+        )
+
+        loadAround(0)
+
+        ScrollTrigger.create({
+          trigger: experience,
+          start: 'top top',
+          end: 'bottom bottom',
+          pin: stage,
+          pinSpacing: false,
+          anticipatePin: 1,
+          invalidateOnRefresh: true,
+        })
+
+        chapters.forEach((chapter, index) => {
+          const tailVh = tailRunwayVh(index)
+
+          ScrollTrigger.create({
+            trigger: chapter,
+            start: 'top 65%',
+            end: 'bottom 65%',
+            onEnter: () => setActiveScene(index),
+            onEnterBack: () => setActiveScene(index),
+          })
+
+          ScrollTrigger.create({
+            trigger: chapter,
+            start: 'top 260%',
+            once: true,
+            onEnter: () => loadAround(index),
+          })
+
+          ScrollTrigger.create({
+            trigger: chapter,
+            start: 'top top',
+            end: `bottom ${tailVh}%`,
+            invalidateOnRefresh: true,
+            onEnter: () => loadAround(index),
+            onEnterBack: () => loadAround(index),
+            onUpdate: (self) => {
+              videoController.seek(`scene-${index}`, diveProgress(self.progress))
+            },
+          })
+
+          if (index === 0) return
+
+          const connectorIndex = index - 1
+          const connector = connectors[connectorIndex]
+          const connectorVisual = connectorVisuals.get(connectorIndex)
+          const hasConnectorClip = Boolean(connector?.video && connectorVisual)
+          const leadVh = hasConnectorClip
+            ? connectorRunwayVh(connector.frames)
+            : OUTRO_VH
+
+          const transition = gsap.timeline({
+            scrollTrigger: {
+              trigger: chapter,
+              start: `top ${leadVh}%`,
+              end: 'top top',
+              scrub: true,
+              invalidateOnRefresh: true,
+              onEnter: () => loadAround(index),
+              onEnterBack: () => loadAround(index - 1),
+              onUpdate: (self) => {
+                if (hasConnectorClip) {
+                  videoController.seek(
+                    `connector-${connectorIndex}`,
+                    connectorProgress(self.progress),
+                  )
+                }
+              },
+            },
+          })
+
+          transition.to(
+            copies[index - 1],
+            { autoAlpha: 0, xPercent: -3, duration: 0.12, ease: 'none' },
+            0,
+          )
+
+          if (hasConnectorClip) {
+            transition
+              .to(
+                sceneVisuals[index - 1],
+                { autoAlpha: 0, duration: CONNECTOR_LEAD, ease: 'none' },
+                0,
+              )
+              .fromTo(
+                connectorVisual,
+                { autoAlpha: 0, immediateRender: false },
+                { autoAlpha: 1, duration: CONNECTOR_LEAD, ease: 'none' },
+                0,
+              )
+              .fromTo(
+                sceneVisuals[index],
+                { autoAlpha: 0, immediateRender: false },
+                { autoAlpha: 1, duration: CONNECTOR_TAIL, ease: 'none' },
+                1 - CONNECTOR_TAIL,
+              )
+              .to(
+                connectorVisual,
+                { autoAlpha: 0, duration: CONNECTOR_TAIL, ease: 'none' },
+                1 - CONNECTOR_TAIL,
+              )
+          } else {
+            transition
+              .to(
+                sceneVisuals[index - 1],
+                { autoAlpha: 0, duration: 1, ease: 'none' },
+                0,
+              )
+              .fromTo(
+                sceneVisuals[index],
+                { autoAlpha: 0, immediateRender: false },
+                { autoAlpha: 1, duration: 1, ease: 'none' },
+                0,
+              )
+          }
+
+          transition.to(
+            copies[index],
+            {
+              autoAlpha: 1,
+              clipPath: 'inset(0 -8% 0 0)',
+              xPercent: 0,
+              duration: 0.28,
+              ease: 'power2.out',
+            },
+            0.68,
+          )
+        })
+
+        document.fonts?.ready.then(() => {
+          if (!cancelled) ScrollTrigger.refresh()
+        })
+
+        return () => {
+          cancelled = true
+          intro.kill()
+          window.clearTimeout(resizeTimer)
+          window.removeEventListener('resize', onResize)
+          internalLinks.forEach((link) =>
+            link.removeEventListener('click', onInternalLinkClick),
+          )
+          window.removeEventListener('popstate', onPopState)
+          window.cancelAnimationFrame(initialHashFrame)
+          smoother.kill()
+          videoController.destroy()
+          chapters.forEach((chapter) => chapter.removeAttribute('aria-hidden'))
+        }
+      },
+    )
+
+    mm.add(
+      '(max-width: 860px) and (prefers-reduced-motion: no-preference)',
+      () => {
+        let cancelled = false
+        const root = document.documentElement
+        const videoController = createVideoController(mobileStage, {
+          mobile: true,
+          maxConcurrentLoads: 1,
+        })
+        const chapters = gsap.utils.toArray('.chapter', experience)
+        const sceneVisuals = gsap.utils.toArray('.scene-visual', mobileStage)
+        const connectorVisuals = new Map(
+          gsap
+            .utils
+            .toArray('.connector-visual', mobileStage)
+            .map((visual) => [Number(visual.dataset.connectorVisual), visual]),
+        )
+        const copies = gsap.utils.toArray('.chapter-copy', copyStage)
+
+        ScrollSmoother.get()?.kill()
+        ScrollTrigger.config({
+          ignoreMobileResize: true,
+          autoRefreshEvents: 'visibilitychange,DOMContentLoaded,load',
+        })
+
+        root.classList.add('is-mobile-cinematic')
+        copyStage.classList.add('is-mobile-copy')
+        chapters.forEach((chapter) => chapter.setAttribute('aria-hidden', 'true'))
+
+        const loadScene = (index) => {
+          if (index < 0 || index >= scenes.length) return
+          videoController.load(`scene-${index}`, true)
+          if (index > 0 && connectors[index - 1]?.mobileVideo) {
+            videoController.load(`connector-${index - 1}`)
+          }
+        }
+
+        const loadAhead = (index) => {
+          if (connectors[index]?.mobileVideo) {
+            videoController.load(`connector-${index}`)
+          }
+          if (index + 1 < scenes.length) {
+            videoController.load(`scene-${index + 1}`)
+          }
+        }
+
+        /*
+         * Portrait clips own all camera motion. Copy and header are the static
+         * anchors; the only supporting motion is the vertical mask handoff.
+         */
+        gsap.set(sceneVisuals, { autoAlpha: 0, scale: 1 })
+        gsap.set(Array.from(connectorVisuals.values()), {
+          autoAlpha: 0,
+          scale: 1,
+        })
+        gsap.set(sceneVisuals[0], { autoAlpha: 1 })
+        gsap.set(copies, {
+          autoAlpha: 0,
+          clipPath: 'inset(100% 0 0 0)',
+          xPercent: 0,
+          yPercent: 4,
+        })
+
+        const intro = gsap.timeline({ defaults: { ease: 'power3.out' } })
+        intro.fromTo(
+          copies[0],
+          {
+            autoAlpha: 0,
+            clipPath: 'inset(100% 0 0 0)',
+            yPercent: 4,
+          },
+          {
+            autoAlpha: 1,
+            clipPath: 'inset(-8% 0 0 0)',
+            yPercent: 0,
+            duration: 0.9,
+          },
+          0.12,
+        )
+
+        loadScene(0)
+
+        const onFirstGesture = () => {
+          videoController.prime()
+          window.removeEventListener('pointerdown', onFirstGesture)
+          window.removeEventListener('touchstart', onFirstGesture)
+        }
+        window.addEventListener('pointerdown', onFirstGesture, {
+          passive: true,
+          once: true,
+        })
+        window.addEventListener('touchstart', onFirstGesture, {
+          passive: true,
+          once: true,
+        })
+
+        ScrollTrigger.create({
+          trigger: experience,
+          start: 'top top',
+          end: 'bottom bottom',
+          pin: mobileStage,
+          pinSpacing: false,
+          anticipatePin: 1,
+          invalidateOnRefresh: true,
+        })
+
+        chapters.forEach((chapter, index) => {
+          const tailVh = mobileTailRunwayVh(index)
+          const diveState = { progress: 0 }
+
+          ScrollTrigger.create({
+            trigger: chapter,
+            start: 'top 62%',
+            end: 'bottom 62%',
+            onEnter: () => setActiveScene(index),
+            onEnterBack: () => setActiveScene(index),
+          })
+
+          gsap.to(diveState, {
+            progress: 1,
+            ease: 'none',
+            onUpdate: () => {
+              videoController.seek(
+                `scene-${index}`,
+                diveProgress(diveState.progress),
+              )
+              if (diveState.progress > 0.22) loadAhead(index)
+            },
+            scrollTrigger: {
+              trigger: chapter,
+              start: 'top top',
+              end: `bottom ${tailVh}%`,
+              scrub: 0.48,
+              invalidateOnRefresh: true,
+              onEnter: () => loadScene(index),
+              onEnterBack: () => loadScene(index),
+            },
+          })
+
+          if (index === 0) return
+
+          const connectorIndex = index - 1
+          const connector = connectors[connectorIndex]
+          const connectorVisual = connectorVisuals.get(connectorIndex)
+          const hasConnectorClip = Boolean(
+            connector?.mobileVideo && connectorVisual,
+          )
+          const leadVh = hasConnectorClip
+            ? mobileConnectorRunwayVh(
+                connector.mobileFrames || connector.frames,
+              )
+            : mobileTailRunwayVh(connectorIndex)
+          const connectorState = { progress: 0 }
+
+          const transition = gsap.timeline({
+            scrollTrigger: {
+              trigger: chapter,
+              start: `top ${leadVh}%`,
+              end: 'top top',
+              scrub: 0.55,
+              invalidateOnRefresh: true,
+              onEnter: () => {
+                loadAhead(index - 1)
+                loadScene(index)
+              },
+              onEnterBack: () => {
+                loadScene(index - 1)
+                loadAhead(index - 1)
+              },
+            },
+          })
+
+          if (hasConnectorClip) {
+            transition.to(
+              connectorState,
+              {
+                progress: 1,
+                duration: 1,
+                ease: 'none',
+                onUpdate: () => {
+                  videoController.seek(
+                    `connector-${connectorIndex}`,
+                    connectorProgress(connectorState.progress),
+                  )
+                },
+              },
+              0,
+            )
+          }
+
+          transition.to(
+            copies[index - 1],
+            {
+              autoAlpha: 0,
+              yPercent: -3,
+              duration: 0.14,
+              ease: 'none',
+            },
+            0,
+          )
+
+          if (hasConnectorClip) {
+            transition
+              .to(
+                sceneVisuals[index - 1],
+                { autoAlpha: 0, duration: CONNECTOR_LEAD, ease: 'none' },
+                0,
+              )
+              .fromTo(
+                connectorVisual,
+                { autoAlpha: 0, immediateRender: false },
+                { autoAlpha: 1, duration: CONNECTOR_LEAD, ease: 'none' },
+                0,
+              )
+              .fromTo(
+                sceneVisuals[index],
+                { autoAlpha: 0, immediateRender: false },
+                { autoAlpha: 1, duration: CONNECTOR_TAIL, ease: 'none' },
+                1 - CONNECTOR_TAIL,
+              )
+              .to(
+                connectorVisual,
+                { autoAlpha: 0, duration: CONNECTOR_TAIL, ease: 'none' },
+                1 - CONNECTOR_TAIL,
+              )
+          } else {
+            transition
+              .to(
+                sceneVisuals[index - 1],
+                { autoAlpha: 0, duration: 1, ease: 'none' },
+                0,
+              )
+              .fromTo(
+                sceneVisuals[index],
+                { autoAlpha: 0, immediateRender: false },
+                { autoAlpha: 1, duration: 1, ease: 'none' },
+                0,
+              )
+          }
+
+          transition.to(
+            copies[index],
+            {
+              autoAlpha: 1,
+              clipPath: 'inset(-8% 0 0 0)',
+              yPercent: 0,
+              duration: 0.26,
+              ease: 'power2.out',
+            },
+            0.66,
+          )
+        })
+
+        let lastWidth = window.innerWidth
+        let resizeTimer = 0
+        const refreshSoon = () => {
+          window.clearTimeout(resizeTimer)
+          resizeTimer = window.setTimeout(() => {
+            if (!cancelled) ScrollTrigger.refresh()
+          }, 240)
+        }
+        const onResize = () => {
+          if (window.innerWidth === lastWidth) return
+          lastWidth = window.innerWidth
+          refreshSoon()
+        }
+        const onOrientationChange = () => refreshSoon()
+        window.addEventListener('resize', onResize)
+        window.addEventListener('orientationchange', onOrientationChange)
+
+        const initialRefreshFrame = window.requestAnimationFrame(() => {
+          if (!cancelled) ScrollTrigger.refresh()
+        })
+        document.fonts?.ready.then(() => {
+          if (!cancelled) ScrollTrigger.refresh()
+        })
+
+        return () => {
+          cancelled = true
+          intro.kill()
+          window.clearTimeout(resizeTimer)
+          window.cancelAnimationFrame(initialRefreshFrame)
+          window.removeEventListener('resize', onResize)
+          window.removeEventListener('orientationchange', onOrientationChange)
+          window.removeEventListener('pointerdown', onFirstGesture)
+          window.removeEventListener('touchstart', onFirstGesture)
+          videoController.destroy()
+          root.classList.remove('is-mobile-cinematic')
+          copyStage.classList.remove('is-mobile-copy')
+          chapters.forEach((chapter) => chapter.removeAttribute('aria-hidden'))
+        }
+      },
+    )
+
+    return () => {
+      mm.revert()
+    }
+  }, [])
+
+  const activeAlign = scenes[activeScene]?.align || 'left'
+  const sideClass = activeAlign.startsWith('right') ? 'is-right' : 'is-left'
+
+  return (
+    <>
+      <a className="skip-link" href="#main">
+        Skip to content
+      </a>
+      <Header />
+      <main id="main" tabIndex="-1">
+        <DesktopCopyStage copyStageRef={copyStageRef} activeScene={activeScene} />
+        <RouteRail activeScene={activeScene} />
+        <div id="smooth-wrapper" ref={smoothWrapperRef}>
+          <div id="smooth-content" ref={smoothContentRef}>
+            <section
+              className="experience"
+              ref={experienceRef}
+              aria-label="digiVance selected work"
+            >
+              <VisualStage
+                stageRef={stageRef}
+                sideClass={sideClass}
+                variant="desktop"
+              />
+              <VisualStage
+                stageRef={mobileStageRef}
+                sideClass="is-mobile"
+                variant="mobile"
+              />
+              <div className="chapters">
+                {scenes.map((scene, index) => (
+                  <Chapter scene={scene} index={index} key={scene.id} />
+                ))}
+              </div>
+            </section>
+          </div>
+        </div>
+      </main>
+    </>
+  )
+}
+
+export default App
