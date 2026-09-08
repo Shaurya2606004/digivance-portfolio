@@ -384,8 +384,15 @@ function createVideoController(
         window.clearTimeout(stallTimer)
         if (destroyed) return undefined
         bandwidthMeter.record(blob.size, performance.now() - startedAt)
+        /*
+         * Cached rather than owned by this controller. The resident window
+         * detaches clips the visitor has scrolled away from, and scrolling back
+         * has to re-attach from these bytes instead of asking the network
+         * again. That means the url must outlive the controller, so it is
+         * deliberately not added to objectUrls, which destroy() revokes.
+         */
         const objectUrl = URL.createObjectURL(blob)
-        objectUrls.add(objectUrl)
+        preloadedMedia.set(source, { objectUrl, size: blob.size })
         return attachObjectUrl(state, objectUrl)
       })
       .catch((error) => {
@@ -543,9 +550,13 @@ function LoadingScreen({ onReady }) {
     let cancelled = false
     let timeoutId = 0
     const abortController = new AbortController()
-    const isMobile = window.matchMedia(
-      '(max-width: 860px), (pointer: coarse)',
-    ).matches
+    /*
+     * The same breakpoint the stage uses. These used to disagree — the
+     * preloader also treated any coarse pointer as mobile — so a touch laptop
+     * downloaded the portrait chain and then ran the desktop cinematic, paying
+     * for the whole journey twice and warming none of what it went on to play.
+     */
+    const isMobile = window.matchMedia(MOBILE_STAGE_QUERY).matches
     const prefersReducedMotion = window.matchMedia(
       '(prefers-reduced-motion: reduce)',
     ).matches
