@@ -9,6 +9,12 @@ import ScrollSmoother from 'gsap/ScrollSmoother'
 import { ScrollTrigger } from 'gsap/ScrollTrigger'
 import { connectors, contactEmail, scenes } from './content'
 import {
+  TIERS,
+  createBandwidthMeter,
+  detectTier,
+  tierSource,
+} from './media'
+import {
   CLIP_FPS,
   CONNECTOR_LEAD,
   CONNECTOR_TAIL,
@@ -37,14 +43,31 @@ const HALF_FRAME = 1 / CLIP_FPS / 2
  * four-frame GOP, so this coalescing keeps even a fast touch flick responsive.
  */
 const SEEK_TIMEOUT_MS = 220
+// A download that goes this long without delivering a byte is stalled, not slow.
+const CLIP_STALL_MS = 4000
 const MAX_CONCURRENT_LOADS = 2
 
-// The first visit warms the exact media chain used by this viewport. Keeping
-// the object URLs here lets the scrub controller use the already-downloaded
-// blobs instead of fetching every clip a second time after the reveal.
+// The first visit warms the complete chain for this viewport. Keeping the
+// object URLs here lets the scrub controller reuse the already-downloaded blobs
+// instead of fetching every clip a second time after the reveal.
 const preloadedMedia = new Map()
 
-function preloadSourcesForViewport(isMobile) {
+/*
+ * One tier decision per visit, shared by the loading screen and both scrub
+ * controllers. When the meter downgrades mid-journey the new tier reaches every
+ * clip that has not been requested yet, so the rest of the scroll gets lighter
+ * rather than stalling.
+ */
+let mediaTier = detectTier()
+const tierListeners = new Set()
+const bandwidthMeter = createBandwidthMeter(mediaTier, (next) => {
+  mediaTier = next
+  tierListeners.forEach((listener) => listener(next))
+})
+
+// The loader owns the full visual chain, so the first reveal is also the point
+// where every video is already available to the scrub controller.
+function preloadSourcesForViewport(isMobile, tier) {
   const sceneImages = scenes.flatMap((scene) => [
     isMobile ? scene.mobileImage : scene.image,
     isMobile ? scene.mobileVideoPoster : scene.videoPoster,
@@ -54,16 +77,17 @@ function preloadSourcesForViewport(isMobile) {
       ? connector.mobilePoster || scenes[index + 1]?.mobileVideoPoster
       : connector.poster,
   ])
+  const clip = (source) => tierSource(source, tier, isMobile)
   const videoSources = [
-    ...scenes.map((scene) => (isMobile ? scene.mobileVideo : scene.video)),
+    ...scenes.map((scene) => clip(isMobile ? scene.mobileVideo : scene.video)),
     ...connectors.map((connector) =>
-      isMobile ? connector.mobileVideo : connector.video,
+      clip(isMobile ? connector.mobileVideo : connector.video),
     ),
-  ]
+  ].filter(Boolean)
 
   return {
     images: [...new Set([...sceneImages, ...connectorImages].filter(Boolean))],
-    videos: [...new Set(videoSources.filter(Boolean))],
+    videos: [...new Set(videoSources)],
   }
 }
 
@@ -158,7 +182,8 @@ function createVideoController(
       key: layer.dataset.mediaKey,
       layer,
       video,
-      source: video.dataset.src,
+      // content.js always names the hd path; the tier picks the directory.
+      hdSource: video.dataset.src,
       ready: false,
       requested: false,
       target: 0,
@@ -220,7 +245,10 @@ function createVideoController(
   }
 
   const pumpLoads = () => {
-    while (activeLoads < maxConcurrentLoads && loadQueue.length) {
+    // A slow connection is better served finishing the clip it needs next than
+    // splitting its bandwidth across two.
+    const limit = mediaTier === TIERS.HD ? maxConcurrentLoads : 1
+    while (activeLoads < limit && loadQueue.length) {
       const job = loadQueue.shift()
       activeLoads += 1
       job().finally(() => {
@@ -257,29 +285,66 @@ function createVideoController(
       state.video.load()
     })
 
+  /*
+   * Streams the clip rather than awaiting a whole blob, so a stalled download
+   * is caught while it is stalling instead of after the full body never
+   * arrives. Bytes and elapsed time feed the meter, which is the only honest
+   * measure of the connection: client hints describe the radio, not the CDN.
+   */
   const fetchClip = (state) => {
-    const cached = preloadedMedia.get(state.source)
+    const source = tierSource(state.hdSource, mediaTier, mobile)
+    if (!source) return Promise.resolve()
+
+    const cached = preloadedMedia.get(source)
     if (cached?.objectUrl) return attachObjectUrl(state, cached.objectUrl)
 
     const controller = new AbortController()
     abortControllers.add(controller)
 
-    return fetch(state.source, { signal: controller.signal })
-      .then((response) => {
+    const startedAt = performance.now()
+    let stallTimer = 0
+    const armStall = () => {
+      window.clearTimeout(stallTimer)
+      stallTimer = window.setTimeout(() => controller.abort(), CLIP_STALL_MS)
+    }
+    armStall()
+
+    return fetch(source, { signal: controller.signal })
+      .then(async (response) => {
         if (!response.ok) throw new Error(`Video request failed: ${response.status}`)
-        return response.blob()
+        if (!response.body) return response.blob()
+
+        const reader = response.body.getReader()
+        const chunks = []
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          chunks.push(value)
+          armStall()
+        }
+        return new Blob(chunks, { type: 'video/mp4' })
       })
       .then((blob) => {
+        window.clearTimeout(stallTimer)
         if (destroyed) return undefined
+        bandwidthMeter.record(blob.size, performance.now() - startedAt)
         const objectUrl = URL.createObjectURL(blob)
         objectUrls.add(objectUrl)
         return attachObjectUrl(state, objectUrl)
       })
       .catch((error) => {
-        if (error.name !== 'AbortError') {
-          state.layer.classList.add('has-media-error')
-          console.warn(error)
+        window.clearTimeout(stallTimer)
+        if (destroyed) return
+        if (error.name === 'AbortError') {
+          // Either the stage is tearing down or the clip stalled. A stalled
+          // clip means this tier is too heavy for the connection, so the layer
+          // holds its poster and the next one is fetched lighter.
+          state.requested = false
+          bandwidthMeter.penalise()
+          return
         }
+        state.layer.classList.add('has-media-error')
+        console.warn(error)
       })
       .finally(() => abortControllers.delete(controller))
   }
@@ -287,6 +352,9 @@ function createVideoController(
   const load = (key, urgent = false) => {
     const state = states.get(key)
     if (!state || destroyed || state.requested) return
+    // Poster mode is a complete visit on its own: the layer's still is already
+    // on screen, so there is nothing to download.
+    if (mediaTier === TIERS.POSTER) return
 
     state.requested = true
     const job = () => (destroyed ? Promise.resolve() : fetchClip(state))
@@ -307,8 +375,24 @@ function createVideoController(
     schedule()
   }
 
+  /*
+   * The meter can change tier mid-journey. Clips already queued resolve their
+   * URL at fetch time and so pick up the new tier on their own; this only has
+   * to wake up the layers that were skipped while the tier was lower.
+   */
+  const onTierChange = () => {
+    if (destroyed || mediaTier === TIERS.POSTER) return
+    states.forEach((state) => {
+      if (!state.ready && !state.requested && isVisible(state.layer)) {
+        load(state.key, true)
+      }
+    })
+  }
+  tierListeners.add(onTierChange)
+
   const destroy = () => {
     destroyed = true
+    tierListeners.delete(onTierChange)
     loadQueue.length = 0
     if (rafId) window.cancelAnimationFrame(rafId)
     abortControllers.forEach((controller) => controller.abort())
@@ -325,6 +409,10 @@ function createVideoController(
   return { load, seek, prime, destroy }
 }
 
+/*
+ * A backstop for a connection that has effectively gone away. The reveal waits
+ * for the complete chain, but never traps a visitor indefinitely.
+ */
 const PRELOAD_TIMEOUT_MS = 45000
 
 function preloadImage(source, signal) {
@@ -405,7 +493,10 @@ function LoadingScreen({ onReady }) {
     const prefersReducedMotion = window.matchMedia(
       '(prefers-reduced-motion: reduce)',
     ).matches
-    const manifest = preloadSourcesForViewport(isMobile)
+    const manifest = preloadSourcesForViewport(
+      isMobile,
+      prefersReducedMotion ? TIERS.POSTER : mediaTier,
+    )
     const tasks = [
       ...manifest.images.map((source) => ({
         id: `image:${source}`,
@@ -413,11 +504,11 @@ function LoadingScreen({ onReady }) {
         source,
         weight: 1,
       })),
-      ...(prefersReducedMotion ? [] : manifest.videos).map((source) => ({
+      ...manifest.videos.map((source) => ({
         id: `video:${source}`,
         type: 'video',
         source,
-        weight: 8,
+        weight: 6,
       })),
       { id: 'fonts', type: 'font', weight: 1 },
     ]
@@ -454,7 +545,8 @@ function LoadingScreen({ onReady }) {
           window.setTimeout(resolve, prefersReducedMotion ? 80 : 420),
         )
       }
-      if (!cancelled) onReady()
+      if (cancelled) return
+      onReady()
     }
 
     const runTask = async (task) => {
