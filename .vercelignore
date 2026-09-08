@@ -3,6 +3,7 @@ dist/
 .asset-originals/
 mobile/
 .claude/
+.vercel/
 
 # Keep only the processed public assets used by the live experience.
 /*.mp4

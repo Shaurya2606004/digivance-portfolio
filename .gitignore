@@ -3,6 +3,7 @@ dist/
 .asset-originals/
 mobile/
 .claude/
+.vercel/
 
 # Local source captures and raw media are not part of the deployed site.
 /*.mp4
