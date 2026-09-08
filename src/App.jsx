@@ -47,6 +47,25 @@ const SEEK_TIMEOUT_MS = 220
 const CLIP_STALL_MS = 4000
 const MAX_CONCURRENT_LOADS = 2
 
+/*
+ * The breakpoint the portrait cinematic runs at. The gsap contexts below match
+ * on the same width, so whichever stage owns the media elements is the stage
+ * that is actually being driven.
+ */
+/*
+ * How many clips may stay attached to a media element at once. Every attached
+ * clip holds a decoder and its decoded frames, which is the expensive resource
+ * on a phone — far more so than the bytes. Keeping a small window around the
+ * visitor and detaching the rest is what stops the portrait stage from running
+ * the tab out of memory partway down the page. The downloaded bytes stay in the
+ * blob cache, so re-attaching a released clip costs no network.
+ */
+const MAX_RESIDENT_CLIPS = { desktop: 6, mobile: 3 }
+
+const MOBILE_STAGE_QUERY = '(max-width: 860px)'
+const isPortraitViewport = () =>
+  typeof window !== 'undefined' && window.matchMedia(MOBILE_STAGE_QUERY).matches
+
 // The first visit warms the complete chain for this viewport. Keeping the
 // object URLs here lets the scrub controller reuse the already-downloaded blobs
 // instead of fetching every clip a second time after the reveal.
@@ -107,6 +126,12 @@ function createVideoController(
   let destroyed = false
   let userReady = false
 
+  // Attach order, oldest first. Trimmed by evictResident.
+  const resident = []
+  const residentCap = mobile
+    ? MAX_RESIDENT_CLIPS.mobile
+    : MAX_RESIDENT_CLIPS.desktop
+
   const schedule = () => {
     if (rafId || destroyed) return
     rafId = window.requestAnimationFrame(step)
@@ -117,6 +142,35 @@ function createVideoController(
     if (seekLock === state.key) seekLock = null
     state.layer.classList.add('is-video-ready')
     schedule()
+  }
+
+  /*
+   * Hands a clip's media element back. The layer falls back to its poster and
+   * the state resets to un-requested, so scrolling into it again re-attaches
+   * from the blob cache without touching the network.
+   */
+  const releaseState = (state) => {
+    if (!state.ready) return
+    state.ready = false
+    state.requested = false
+    state.primed = false
+    state.applied = -1
+    state.layer.classList.remove('is-video-ready')
+    state.video.removeAttribute('src')
+    state.video.load()
+  }
+
+  const evictResident = () => {
+    while (resident.length > residentCap) {
+      // Never release what is on screen; look further back instead.
+      const index = resident.findIndex((key) => {
+        const candidate = states.get(key)
+        return candidate && !isVisible(candidate.layer)
+      })
+      if (index === -1) break
+      const [key] = resident.splice(index, 1)
+      releaseState(states.get(key))
+    }
   }
 
   const isVisible = (layer) => {
@@ -269,6 +323,8 @@ function createVideoController(
         state.video.removeEventListener('error', onError)
         state.ready = true
         state.applied = -1
+        resident.push(state.key)
+        evictResident()
         if (userReady) primeState(state)
         schedule()
         resolve()
@@ -806,6 +862,7 @@ const VisualStage = memo(function VisualStage({
   stageRef,
   sideClass,
   variant = 'desktop',
+  active = true,
 }) {
   const isMobile = variant === 'mobile'
 
@@ -837,7 +894,7 @@ const VisualStage = memo(function VisualStage({
                 fetchPriority={index === 0 ? 'high' : 'auto'}
                 decoding="async"
               />
-              {video && (
+              {active && video && (
                 <video
                   className="scrub-video"
                   data-src={video}
@@ -871,15 +928,17 @@ const VisualStage = memo(function VisualStage({
                 loading="lazy"
                 decoding="async"
               />
-              <video
-                className="scrub-video"
-                data-src={video}
-                muted
-                playsInline
-                preload="none"
-                disablePictureInPicture
-                tabIndex="-1"
-              />
+              {active && (
+                <video
+                  className="scrub-video"
+                  data-src={video}
+                  muted
+                  playsInline
+                  preload="none"
+                  disablePictureInPicture
+                  tabIndex="-1"
+                />
+              )}
             </figure>
           ) : null
         })}
@@ -899,6 +958,23 @@ function App() {
   const smoothContentRef = useRef(null)
   const [activeScene, setActiveScene] = useState(0)
   const [isReady, setIsReady] = useState(false)
+  /*
+   * Both stages stay mounted so the scroll choreography and poster art never
+   * have to be rebuilt, but only one of them creates <video> elements. iOS
+   * Safari caps how many media elements a page may hold at once, and mounting
+   * the desktop and portrait chains together put the page at twenty-two before
+   * a single clip had loaded — comfortably over the cap, which is what made the
+   * stage fail on phones.
+   */
+  const [portraitStage, setPortraitStage] = useState(isPortraitViewport)
+
+  useEffect(() => {
+    const query = window.matchMedia(MOBILE_STAGE_QUERY)
+    const sync = () => setPortraitStage(query.matches)
+    sync()
+    query.addEventListener('change', sync)
+    return () => query.removeEventListener('change', sync)
+  }, [])
 
   useLayoutEffect(() => {
     const experience = experienceRef.current
@@ -1490,7 +1566,9 @@ function App() {
     return () => {
       mm.revert()
     }
-  }, [isReady])
+    // portraitStage decides which stage holds the media elements, so the
+    // controllers have to be rebuilt against the tree that actually has them.
+  }, [isReady, portraitStage])
 
   if (!isReady) {
     return <LoadingScreen onReady={() => setIsReady(true)} />
@@ -1519,11 +1597,13 @@ function App() {
                 stageRef={stageRef}
                 sideClass={sideClass}
                 variant="desktop"
+                active={!portraitStage}
               />
               <VisualStage
                 stageRef={mobileStageRef}
                 sideClass="is-mobile"
                 variant="mobile"
+                active={portraitStage}
               />
               <div className="chapters">
                 {scenes.map((scene, index) => (
