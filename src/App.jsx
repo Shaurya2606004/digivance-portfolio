@@ -1,4 +1,4 @@
-import { memo, useLayoutEffect, useRef, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
   ArrowDownRight,
   ArrowUpRight,
@@ -38,6 +38,34 @@ const HALF_FRAME = 1 / CLIP_FPS / 2
  */
 const SEEK_TIMEOUT_MS = 220
 const MAX_CONCURRENT_LOADS = 2
+
+// The first visit warms the exact media chain used by this viewport. Keeping
+// the object URLs here lets the scrub controller use the already-downloaded
+// blobs instead of fetching every clip a second time after the reveal.
+const preloadedMedia = new Map()
+
+function preloadSourcesForViewport(isMobile) {
+  const sceneImages = scenes.flatMap((scene) => [
+    isMobile ? scene.mobileImage : scene.image,
+    isMobile ? scene.mobileVideoPoster : scene.videoPoster,
+  ])
+  const connectorImages = connectors.flatMap((connector, index) => [
+    isMobile
+      ? connector.mobilePoster || scenes[index + 1]?.mobileVideoPoster
+      : connector.poster,
+  ])
+  const videoSources = [
+    ...scenes.map((scene) => (isMobile ? scene.mobileVideo : scene.video)),
+    ...connectors.map((connector) =>
+      isMobile ? connector.mobileVideo : connector.video,
+    ),
+  ]
+
+  return {
+    images: [...new Set([...sceneImages, ...connectorImages].filter(Boolean))],
+    videos: [...new Set(videoSources.filter(Boolean))],
+  }
+}
 
 function createVideoController(
   stage,
@@ -202,7 +230,37 @@ function createVideoController(
     }
   }
 
+  const attachObjectUrl = (state, objectUrl) =>
+    new Promise((resolve) => {
+      if (destroyed) {
+        resolve()
+        return
+      }
+
+      const onLoadedData = () => {
+        state.video.removeEventListener('error', onError)
+        state.ready = true
+        state.applied = -1
+        if (userReady) primeState(state)
+        schedule()
+        resolve()
+      }
+      const onError = () => {
+        state.video.removeEventListener('loadeddata', onLoadedData)
+        state.layer.classList.add('has-media-error')
+        resolve()
+      }
+
+      state.video.addEventListener('loadeddata', onLoadedData, { once: true })
+      state.video.addEventListener('error', onError, { once: true })
+      state.video.src = objectUrl
+      state.video.load()
+    })
+
   const fetchClip = (state) => {
+    const cached = preloadedMedia.get(state.source)
+    if (cached?.objectUrl) return attachObjectUrl(state, cached.objectUrl)
+
     const controller = new AbortController()
     abortControllers.add(controller)
 
@@ -211,37 +269,12 @@ function createVideoController(
         if (!response.ok) throw new Error(`Video request failed: ${response.status}`)
         return response.blob()
       })
-      .then(
-        (blob) =>
-          new Promise((resolve) => {
-            if (destroyed) {
-              resolve()
-              return
-            }
-
-            const objectUrl = URL.createObjectURL(blob)
-            objectUrls.add(objectUrl)
-
-            const onLoadedData = () => {
-              state.video.removeEventListener('error', onError)
-              state.ready = true
-              state.applied = -1
-              if (userReady) primeState(state)
-              schedule()
-              resolve()
-            }
-            const onError = () => {
-              state.video.removeEventListener('loadeddata', onLoadedData)
-              state.layer.classList.add('has-media-error')
-              resolve()
-            }
-
-            state.video.addEventListener('loadeddata', onLoadedData, { once: true })
-            state.video.addEventListener('error', onError, { once: true })
-            state.video.src = objectUrl
-            state.video.load()
-          }),
-      )
+      .then((blob) => {
+        if (destroyed) return undefined
+        const objectUrl = URL.createObjectURL(blob)
+        objectUrls.add(objectUrl)
+        return attachObjectUrl(state, objectUrl)
+      })
       .catch((error) => {
         if (error.name !== 'AbortError') {
           state.layer.classList.add('has-media-error')
@@ -290,6 +323,222 @@ function createVideoController(
   }
 
   return { load, seek, prime, destroy }
+}
+
+const PRELOAD_TIMEOUT_MS = 45000
+
+function preloadImage(source, signal) {
+  return fetch(source, { cache: 'force-cache', signal })
+    .then((response) => {
+      if (!response.ok) throw new Error(`Image request failed: ${response.status}`)
+      return response.blob()
+    })
+    .then(
+      (blob) =>
+        new Promise((resolve, reject) => {
+          const objectUrl = URL.createObjectURL(blob)
+          const image = new Image()
+          const cleanUp = () => URL.revokeObjectURL(objectUrl)
+          image.onload = () => {
+            cleanUp()
+            resolve()
+          }
+          image.onerror = () => {
+            cleanUp()
+            reject(new Error(`Image decode failed: ${source}`))
+          }
+          image.src = objectUrl
+        }),
+    )
+}
+
+function preloadVideo(source, signal, onProgress) {
+  const cached = preloadedMedia.get(source)
+  if (cached?.objectUrl) {
+    onProgress(1)
+    return Promise.resolve()
+  }
+
+  return fetch(source, { cache: 'force-cache', signal })
+    .then((response) => {
+      if (!response.ok) throw new Error(`Video request failed: ${response.status}`)
+
+      const total = Number(response.headers.get('content-length'))
+      if (!response.body || !Number.isFinite(total) || total <= 0) {
+        onProgress(0.35)
+        return response.blob()
+      }
+
+      const reader = response.body.getReader()
+      const chunks = []
+      let received = 0
+
+      const readChunk = () =>
+        reader.read().then(({ done, value }) => {
+          if (done) return new Blob(chunks, { type: response.headers.get('content-type') || 'video/mp4' })
+          chunks.push(value)
+          received += value.byteLength
+          onProgress(Math.min(0.92, received / total))
+          return readChunk()
+        })
+
+      return readChunk()
+    })
+    .then((blob) => {
+      const objectUrl = URL.createObjectURL(blob)
+      preloadedMedia.set(source, { objectUrl, size: blob.size })
+      onProgress(1)
+    })
+}
+
+function LoadingScreen({ onReady }) {
+  const [progress, setProgress] = useState(0)
+  const [status, setStatus] = useState('Loading scene art')
+
+  useEffect(() => {
+    let cancelled = false
+    let timeoutId = 0
+    const abortController = new AbortController()
+    const isMobile = window.matchMedia(
+      '(max-width: 860px), (pointer: coarse)',
+    ).matches
+    const prefersReducedMotion = window.matchMedia(
+      '(prefers-reduced-motion: reduce)',
+    ).matches
+    const manifest = preloadSourcesForViewport(isMobile)
+    const tasks = [
+      ...manifest.images.map((source) => ({
+        id: `image:${source}`,
+        type: 'image',
+        source,
+        weight: 1,
+      })),
+      ...(prefersReducedMotion ? [] : manifest.videos).map((source) => ({
+        id: `video:${source}`,
+        type: 'video',
+        source,
+        weight: 8,
+      })),
+      { id: 'fonts', type: 'font', weight: 1 },
+    ]
+    const values = new Map(tasks.map((task) => [task.id, 0]))
+    const totalWeight = tasks.reduce((total, task) => total + task.weight, 0)
+    let failed = 0
+    let cursor = 0
+    let completed = 0
+    let finished = false
+
+    const updateProgress = () => {
+      if (cancelled) return
+      const loadedWeight = [...values].reduce(
+        (total, [id, value]) =>
+          total + (tasks.find((task) => task.id === id)?.weight || 0) * value,
+        0,
+      )
+      setProgress(Math.min(99, Math.round((loadedWeight / totalWeight) * 100)))
+    }
+
+    const finish = async (timedOut = false) => {
+      if (finished || cancelled) return
+      finished = true
+      window.clearTimeout(timeoutId)
+      if (timedOut) {
+        abortController.abort()
+        setStatus('Opening with poster fallback')
+        setProgress((value) => Math.max(value, 94))
+        await new Promise((resolve) => window.setTimeout(resolve, 520))
+      } else {
+        setStatus(failed ? 'Ready with poster fallbacks' : 'Ready')
+        setProgress(100)
+        await new Promise((resolve) =>
+          window.setTimeout(resolve, prefersReducedMotion ? 80 : 420),
+        )
+      }
+      if (!cancelled) onReady()
+    }
+
+    const runTask = async (task) => {
+      try {
+        if (task.type === 'image') {
+          if (!finished) setStatus('Loading scene art')
+          await preloadImage(task.source, abortController.signal)
+        } else if (task.type === 'video') {
+          if (!finished) setStatus('Loading video journey')
+          await preloadVideo(task.source, abortController.signal, (value) => {
+            values.set(task.id, value)
+            updateProgress()
+          })
+        } else {
+          if (!finished) setStatus('Loading type and interface')
+          await document.fonts?.ready
+        }
+      } catch (error) {
+        if (error.name !== 'AbortError') failed += 1
+      } finally {
+        values.set(task.id, 1)
+        completed += 1
+        updateProgress()
+      }
+    }
+
+    const runQueue = async () => {
+      const worker = async () => {
+        while (!cancelled && cursor < tasks.length) {
+          const task = tasks[cursor]
+          cursor += 1
+          await runTask(task)
+        }
+      }
+      await Promise.all([worker(), worker()])
+      if (completed === tasks.length) await finish()
+    }
+
+    document.documentElement.classList.add('is-loading')
+    document.body.classList.add('is-loading')
+    timeoutId = window.setTimeout(() => finish(true), PRELOAD_TIMEOUT_MS)
+    runQueue()
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timeoutId)
+      abortController.abort()
+      document.documentElement.classList.remove('is-loading')
+      document.body.classList.remove('is-loading')
+    }
+  }, [onReady])
+
+  return (
+    <div className="loading-screen" role="status" aria-live="polite">
+      <div className="loading-header">
+        <span className="wordmark" aria-label="digiVance">
+          digi<span>V</span>ance
+        </span>
+        <span className="loading-label">Portfolio experience</span>
+      </div>
+      <div className="loading-core">
+        <p className="loading-kicker">Loading the visual journey</p>
+        <p className="loading-value" aria-hidden="true">
+          {String(progress).padStart(2, '0')}
+          <span>%</span>
+        </p>
+        <div
+          className="loading-meter"
+          role="progressbar"
+          aria-label="Loading digiVance portfolio"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow={progress}
+        >
+          <span style={{ transform: `scaleX(${progress / 100})` }} />
+        </div>
+        <p className="loading-status">{status}</p>
+      </div>
+      <div className="loading-footer">
+        <span>Websites and digital products for business</span>
+        <span>Preparing your view</span>
+      </div>
+    </div>
+  )
 }
 
 function Wordmark() {
@@ -557,6 +806,7 @@ function App() {
   const smoothWrapperRef = useRef(null)
   const smoothContentRef = useRef(null)
   const [activeScene, setActiveScene] = useState(0)
+  const [isReady, setIsReady] = useState(false)
 
   useLayoutEffect(() => {
     const experience = experienceRef.current
@@ -1148,7 +1398,11 @@ function App() {
     return () => {
       mm.revert()
     }
-  }, [])
+  }, [isReady])
+
+  if (!isReady) {
+    return <LoadingScreen onReady={() => setIsReady(true)} />
+  }
 
   const activeAlign = scenes[activeScene]?.align || 'left'
   const sideClass = activeAlign.startsWith('right') ? 'is-right' : 'is-left'
