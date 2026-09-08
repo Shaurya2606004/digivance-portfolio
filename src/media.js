@@ -55,7 +55,7 @@ function overrideTier() {
  * deliberately pessimistic: starting lite and upgrading is a better first
  * impression than starting hd and stalling.
  */
-export function detectTier() {
+export function detectTier(isMobile = false) {
   const forced = overrideTier()
   if (forced) return forced
 
@@ -67,6 +67,7 @@ export function detectTier() {
   if (!connection) {
     // No Network Information API (Safari, Firefox). Device memory is the only
     // other signal available, and the runtime meter corrects from there.
+    if (isMobile) return TIERS.LITE
     return (navigator.deviceMemory || 8) >= 8 ? TIERS.HD : TIERS.LITE
   }
 
@@ -75,6 +76,12 @@ export function detectTier() {
   const effectiveType = connection.effectiveType || '4g'
   if (effectiveType === 'slow-2g' || effectiveType === '2g') return TIERS.POSTER
   if (effectiveType === '3g') return TIERS.LITE
+
+  // Portrait video is already a separate, native chain. Keep phones on the
+  // lighter encode by default—even on a fast 4G/Wi-Fi signal—so a full-chain
+  // preloader does not ask a handset to hold 35 MB of video before reveal.
+  // `?quality=hd` remains available for a deliberate high-quality override.
+  if (isMobile) return TIERS.LITE
 
   const downlink = connection.downlink || 0
   const memory = navigator.deviceMemory || 8

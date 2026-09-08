@@ -71,9 +71,11 @@ const targets = [
     id: 'mobile-lite',
     from: 'video-mobile',
     to: 'video-mobile-lite',
-    filter: 'hqdn3d=3:2:6:6,scale=480:-2:flags=lanczos',
-    crf: 29,
-    gop: 4,
+    // 360px is enough for a portrait phone viewport and cuts the full-chain
+    // preload by roughly half again without changing the native composition.
+    filter: 'hqdn3d=3:2:6:6,scale=360:-2:flags=lanczos',
+    crf: 31,
+    gop: 6,
   },
 ]
 

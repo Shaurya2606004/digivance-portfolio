@@ -77,7 +77,7 @@ const preloadedMedia = new Map()
  * clip that has not been requested yet, so the rest of the scroll gets lighter
  * rather than stalling.
  */
-let mediaTier = detectTier()
+let mediaTier = detectTier(isPortraitViewport())
 const tierListeners = new Set()
 const bandwidthMeter = createBandwidthMeter(mediaTier, (next) => {
   mediaTier = next
@@ -648,7 +648,12 @@ function LoadingScreen({ onReady }) {
           await runTask(task)
         }
       }
-      await Promise.all([worker(), worker()])
+      // One in-flight video on a phone keeps radio, memory and decoder pressure
+      // predictable while the meter warms the complete chain.
+      const workerCount = isMobile ? 1 : 2
+      await Promise.all(
+        Array.from({ length: workerCount }, () => worker()),
+      )
       if (completed === tasks.length) await finish()
     }
 
