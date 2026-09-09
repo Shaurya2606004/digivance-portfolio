@@ -4,8 +4,15 @@
  *
  * The original desktop clips were all-intra (every frame a keyframe), which is
  * why a single 8s shot cost 12.7 MB and the whole desktop journey cost 131 MB.
- * Scrubbing does not need all-intra: the clip is decoded from an in-memory blob,
- * so a short GOP seeks just as well for a fraction of the bytes.
+ * On desktop a short GOP seeks just as well for a fraction of the bytes.
+ *
+ * Phones are the exception. A scrub assigns `currentTime` every frame, and on
+ * iOS every seek that lands off a keyframe has to decode forward from the
+ * preceding one -- with B-frames, out of order. At GOP 6 that is up to five
+ * dependent frames of work on every draw: a fixed cost that shows up as
+ * constant micro-stutter from first paint, never worsening, never absent. The
+ * mobile targets are therefore all-intra (`-g 1 -bf 0`) so a seek is one
+ * decode, and carry a higher CRF to pay for it.
  *
  * Each viewport gets an `hd` tier and a `lite` tier. The lite tier is what a
  * slow connection actually downloads, and it is roughly a tenth of the size.
@@ -25,14 +32,13 @@ const root = path.resolve(import.meta.dirname, '..')
 const publicDir = path.join(root, 'public', 'assets')
 const backupDir = path.join(root, '.asset-originals')
 
-// Shared across every encode. `-g` is set per target.
+// Shared across every encode. `-g` and `-bf` are set per target.
 const BASE = [
   '-an',
   '-c:v', 'libx264',
   '-profile:v', 'high',
   '-pix_fmt', 'yuv420p',
   '-preset', 'slow',
-  '-bf', '2',
   '-sc_threshold', '0',
   '-movflags', '+faststart',
 ]
@@ -50,6 +56,7 @@ const targets = [
     filter: 'hqdn3d=2:1.5:4:4,scale=1600:-2:flags=lanczos',
     crf: 25,
     gop: 8,
+    bf: 2,
   },
   {
     id: 'desktop-lite',
@@ -58,14 +65,16 @@ const targets = [
     filter: 'hqdn3d=3:2:6:6,scale=960:-2:flags=lanczos',
     crf: 28,
     gop: 8,
+    bf: 2,
   },
   {
     id: 'mobile-hd',
     from: 'video-mobile',
     to: 'video-mobile',
     filter: 'hqdn3d=2:1.5:4:4,scale=720:-2:flags=lanczos',
-    crf: 26,
-    gop: 4,
+    crf: 31,
+    gop: 1,
+    bf: 0,
   },
   {
     id: 'mobile-lite',
@@ -74,8 +83,9 @@ const targets = [
     // 360px is enough for a portrait phone viewport and cuts the full-chain
     // preload by roughly half again without changing the native composition.
     filter: 'hqdn3d=3:2:6:6,scale=360:-2:flags=lanczos',
-    crf: 31,
-    gop: 6,
+    crf: 28,
+    gop: 1,
+    bf: 0,
   },
 ]
 
@@ -147,6 +157,7 @@ async function encodeTarget(target) {
       '-crf', String(target.crf),
       '-g', String(target.gop),
       '-keyint_min', String(target.gop),
+      '-bf', String(target.bf),
       output,
     ])
 
